@@ -14,32 +14,20 @@ import multiprocessing
 import matplotlib.dates as mdates
 import ast
 
-# ---------------------------------------------------------------------
-# Global Variables and Configuration
-# ---------------------------------------------------------------------
-stock_symbol = "VZ"
-output_folder = stock_symbol  # Folder that has the same name as the stock symbol
+stock_symbol = ""
+output_folder = stock_symbol  
 
-# Ensure the folder exists (optional safety check)
 os.makedirs(output_folder, exist_ok=True)
 
-# Read the cleaned CSV from the symbol folder
 data_path = os.path.join(output_folder, f'cleaned_{stock_symbol}_data.csv')
 df = pd.read_csv(data_path)
-df['Date'] = pd.to_datetime(df['Date'])  # Ensure 'Date' column is datetime
+df['Date'] = pd.to_datetime(df['Date'])  
 
-column_name = 'adjusted_close_price'  # Column to be modeled
+column_name = 'adjusted_close_price'
 scaler = MinMaxScaler(feature_range=(0, 1))
 scaled_data = scaler.fit_transform(df[[column_name]].values)
 
-# ---------------------------------------------------------------------
-# Dataset Creation
-# ---------------------------------------------------------------------
 def create_dataset(data, look_back=1):
-    """
-    Converts a 1D time series into a dataset suitable for SGB,
-    using a 'look_back' window so each sample is shape (look_back,).
-    """
     X, Y = [], []
     for i in range(len(data) - look_back):
         X.append(data[i:(i + look_back), 0])
@@ -49,31 +37,20 @@ def create_dataset(data, look_back=1):
 look_back = 30
 X, Y = create_dataset(scaled_data, look_back)
 
-# Train/Test Split
 train_size = int(len(X) * 0.8)
 test_size = len(X) - train_size
 trainX, testX = X[:train_size], X[train_size:]
 trainY, testY = Y[:train_size], Y[train_size:]
 
-# ---------------------------------------------------------------------
-# Build & "Compile" the Model (SGB version, no attention)
-# ---------------------------------------------------------------------
 def build_model(learning_rate):
-    """
-    Creates a GradientBoostingRegressor. We'll interpret 'learning_rate'
-    as the shrinkage parameter. Setting 'subsample < 1.0' for stochastic behavior.
-    """
     model = GradientBoostingRegressor(
         learning_rate=learning_rate,
         n_estimators=100,
-        subsample=0.8,  # < 1 => Stochastic gradient boosting
+        subsample=0.8,  
         random_state=42
     )
     return model
 
-# ---------------------------------------------------------------------
-# Date Ranges for MAE Calculation
-# ---------------------------------------------------------------------
 date_ranges = [
     ('2015-01-01', '2018-12-31'),
     ('2018-01-01', '2020-12-31'),
@@ -81,58 +58,36 @@ date_ranges = [
     ('2022-01-01', '2024-12-31')
 ]
 
-# ---------------------------------------------------------------------
-# MAE Calculation Function (cast to float)
-# ---------------------------------------------------------------------
 def calculate_mae(diff_plot, date_ranges):
-    """
-    Calculates MAE in diff_plot for each start-end date in date_ranges.
-    Returns a list of (start_date, end_date, mae_as_float).
-    """
     mae_ranges = []
     for start_date, end_date in date_ranges:
         mask = (df['Date'] >= start_date) & (df['Date'] <= end_date)
         range_diff = diff_plot[mask]
 
-        # Convert to plain float so we don't get np.float64(...) in CSV
         mae_value = float(np.mean(np.abs(range_diff[~np.isnan(range_diff)])))
         mae_ranges.append((start_date, end_date, mae_value))
     return mae_ranges
 
-# ---------------------------------------------------------------------
-# Parallelized Training Function
-# ---------------------------------------------------------------------
 def train_model_with_lr(lr):
-    """
-    1) Builds a GradientBoostingRegressor with learning_rate=lr.
-    2) Fits on trainX, trainY (no attention).
-    3) Predicts on train/test sets.
-    4) Calculates date-range-based MAE.
-    Returns: (lr, mae_ranges)
-    """
+
     model = build_model(lr)
 
-    # Fit on raw trainX, trainY
     model.fit(trainX, trainY)
 
-    # Predict on train and test
     trainPredict = model.predict(trainX)
     testPredict = model.predict(testX)
 
-    # Invert scaling
     trainPredict = scaler.inverse_transform(trainPredict.reshape(-1, 1))
     testPredict = scaler.inverse_transform(testPredict.reshape(-1, 1))
     trainY_inv = scaler.inverse_transform(trainY.reshape(1, -1))
     testY_inv = scaler.inverse_transform(testY.reshape(1, -1))
 
-    # Prepare the difference array for MAE
     diff_train = trainPredict[:, 0] - trainY_inv[0][:len(trainPredict)]
     diff_test = testPredict[:, 0] - testY_inv[0][:len(testPredict)]
 
     diff_plot = np.empty_like(scaled_data)
     diff_plot[:, :] = np.nan
 
-    # Align predictions with the actual data timeline
     trainPredictStart = look_back
     trainPredictEnd = trainPredictStart + len(diff_train)
     testPredictStart = trainPredictEnd
@@ -144,11 +99,7 @@ def train_model_with_lr(lr):
     mae_ranges = calculate_mae(diff_plot, date_ranges)
     return (lr, mae_ranges)
 
-# ---------------------------------------------------------------------
-# Hyperparameter Search & MAE Logging (PARALLEL)
-# ---------------------------------------------------------------------
 if __name__ == '__main__':
-    # Instead of searching a linear space, we use a predefined list of typical learning rates
     learning_rates = [
         0.0001, 0.0005, 0.001, 0.0025, 0.005, 0.0075,
         0.01, 0.02, 0.03, 0.05, 0.07, 0.1,
@@ -160,19 +111,14 @@ if __name__ == '__main__':
 
     results = Parallel(n_jobs=n_jobs)(delayed(train_model_with_lr)(lr) for lr in learning_rates)
 
-    # Save results to CSV inside the stock symbol folder
     mae_results_path = os.path.join(output_folder, f'{stock_symbol}_mae_results.csv')
     results_df = pd.DataFrame(results, columns=['Learning Rate', 'MAE Ranges'])
     results_df.to_csv(mae_results_path, index=False)
     print(f"MAE results saved to {mae_results_path}")
 
-    # ---------------------------------------------------------------------
-    # Post-Processing the MAE Results
-    # ---------------------------------------------------------------------
     file_path = mae_results_path
     df_csv = pd.read_csv(file_path)
 
-    # Transform the "MAE Ranges" column into separate columns
     transformed_data = {'Learning Rate': df_csv['Learning Rate']}
     columns_set = set()
 
@@ -193,7 +139,6 @@ if __name__ == '__main__':
     transformed_df = pd.DataFrame(transformed_data)
     transformed_df.to_csv(file_path, index=False)
 
-    # If you don't truly have 2 extra lines, change skipfooter=2 to skipfooter=0 or remove it entirely
     df_csv = pd.read_csv(file_path, skipfooter=2, engine='python')
     mean_values = df_csv.iloc[:, 1:].mean(axis=1)
     median_values = df_csv.iloc[:, 1:].median(axis=1)
@@ -217,9 +162,6 @@ if __name__ == '__main__':
     print(f"\nBest LR by Mean: {min_mean_learning_rate}, Value: {min_mean_value}")
     print(f"Best LR by Median: {min_median_learning_rate}, Value: {min_median_value}")
 
-    # ---------------------------------------------------------------------
-    # Retrain with Best LR and Visualize (SGB, no attention)
-    # ---------------------------------------------------------------------
     df_final = pd.read_csv(data_path)
     LR = min_median_learning_rate
 
@@ -247,7 +189,6 @@ if __name__ == '__main__':
     trainPredict_final = model_final.predict(trainX_final)
     testPredict_final = model_final.predict(testX_final)
 
-    # Invert scaling
     trainPredict_final = scaler_final.inverse_transform(trainPredict_final.reshape(-1, 1))
     testPredict_final = scaler_final.inverse_transform(testPredict_final.reshape(-1, 1))
     trainY_inv_final = scaler_final.inverse_transform(trainY_final.reshape(1, -1))
@@ -277,7 +218,6 @@ if __name__ == '__main__':
     average_error_final = np.mean(np.abs(diff_plot_final[~np.isnan(diff_plot_final)]))
     print(f"\nFinal model average error (MAE): {average_error_final:.4f}")
 
-    # Plot actual vs. predicted
     fig_final, (ax1_final, ax2_final) = plt.subplots(2, 1, figsize=(12, 12), sharex=True)
 
     ax1_final.plot(
