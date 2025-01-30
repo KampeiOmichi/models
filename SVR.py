@@ -5,41 +5,27 @@ import requests
 from datetime import datetime
 import matplotlib.pyplot as plt
 import numpy as np
-
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.svm import SVR
-
 from joblib import Parallel, delayed
 import multiprocessing
 import matplotlib.dates as mdates
 import ast
 
-# ---------------------------------------------------------------------
-# Global Variables and Configuration
-# ---------------------------------------------------------------------
-stock_symbol = "PFE"
-output_folder = stock_symbol  # Folder that has the same name as the stock symbol
+stock_symbol = ""
+output_folder = stock_symbol 
 
-# Ensure the folder exists (optional safety check)
 os.makedirs(output_folder, exist_ok=True)
 
-# Read the cleaned CSV from the symbol folder
 data_path = os.path.join(output_folder, f'cleaned_{stock_symbol}_data.csv')
 df = pd.read_csv(data_path)
-df['Date'] = pd.to_datetime(df['Date'])  # Ensure 'Date' column is datetime
+df['Date'] = pd.to_datetime(df['Date']) 
 
-column_name = 'adjusted_close_price'  # Column to be modeled
+column_name = 'adjusted_close_price'  
 scaler = MinMaxScaler(feature_range=(0, 1))
 scaled_data = scaler.fit_transform(df[[column_name]].values)
 
-# ---------------------------------------------------------------------
-# Dataset Creation
-# ---------------------------------------------------------------------
 def create_dataset(data, look_back=1):
-    """
-    Converts a 1D time series into a dataset suitable for SVR,
-    still using a 'look_back' window. Each sample is shape (look_back,).
-    """
     X, Y = [], []
     for i in range(len(data) - look_back):
         X.append(data[i:(i + look_back), 0])
@@ -49,76 +35,43 @@ def create_dataset(data, look_back=1):
 look_back = 30
 X, Y = create_dataset(scaled_data, look_back)
 
-# Train/Test Split
 train_size = int(len(X) * 0.8)
 test_size = len(X) - train_size
 trainX, testX = X[:train_size], X[train_size:]
 trainY, testY = Y[:train_size], Y[train_size:]
 
-# ---------------------------------------------------------------------
-# Attention Layer Definition (NumPy Implementation)
-# ---------------------------------------------------------------------
+
 class AttentionLayer:
-    """
-    A custom 'Attention Layer' in NumPy form. Given a batch of shape
-    (samples, look_back), we treat look_back as the 'time' dimension
-    and apply attention weights across those timesteps.
-    
-    The logic mimics:
-        e = tanh(X W + b)
-        a = softmax(e, axis=time)
-        output = sum(X * a)
-    
-    We'll maintain simple W, b in shape (1,1) for demonstration.
-    """
+
     def __init__(self, look_back):
         self.look_back = look_back
-        # Simple random init for demonstration
         self.W = np.random.uniform(-0.1, 0.1, (1, 1))
         self.b = np.zeros((1,))
 
     def _softmax(self, e):
-        # e shape: (samples, look_back, 1)
         e_max = np.max(e, axis=1, keepdims=True)
-        exp_e = np.exp(e - e_max)  # subtract max for numerical stability
+        exp_e = np.exp(e - e_max)  
         sum_exp = np.sum(exp_e, axis=1, keepdims=True)
         return exp_e / sum_exp
 
     def apply_attention(self, X_in):
-        """
-        X_in: shape (samples, look_back).
-        Returns: shape (samples,) => single attention-weighted sum per sample
-        """
+
         samples = X_in.shape[0]
         X_3d = X_in.reshape((samples, self.look_back, 1))
 
-        # e = tanh(x_t * W + b) per timestep
-        e = np.tanh(X_3d * self.W + self.b)  # shape: (samples, look_back, 1)
+        e = np.tanh(X_3d * self.W + self.b)  
 
-        # a = softmax(e) across time dimension
-        a = self._softmax(e)  # shape: (samples, look_back, 1)
+        a = self._softmax(e)  
 
-        # Weighted sum over time
-        weighted_sum = np.sum(X_3d * a, axis=1)  # shape: (samples, 1)
+        weighted_sum = np.sum(X_3d * a, axis=1)  
         return weighted_sum.flatten()
 
-# Single global attention object (optional design choice)
 attention_layer = AttentionLayer(look_back=look_back)
 
-# ---------------------------------------------------------------------
-# Build & "Compile" the Model (SVR version)
-# ---------------------------------------------------------------------
 def build_model(gamma_value):
-    """
-    Creates an SVR model. We'll interpret 'gamma_value' as the gamma
-    parameter for the RBF kernel.
-    """
     model = SVR(kernel='rbf', C=1.0, gamma=gamma_value)
     return model
 
-# ---------------------------------------------------------------------
-# Date Ranges for MAE Calculation
-# ---------------------------------------------------------------------
 date_ranges = [
     ('2015-01-01', '2018-12-31'),
     ('2018-01-01', '2020-12-31'),
@@ -126,9 +79,6 @@ date_ranges = [
     ('2022-01-01', '2024-12-31')
 ]
 
-# ---------------------------------------------------------------------
-# MAE Calculation Function (cast to float)
-# ---------------------------------------------------------------------
 def calculate_mae(diff_plot, date_ranges):
     """
     Calculates MAE in diff_plot for each start-end date in date_ranges.
@@ -138,35 +88,21 @@ def calculate_mae(diff_plot, date_ranges):
     for start_date, end_date in date_ranges:
         mask = (df['Date'] >= start_date) & (df['Date'] <= end_date)
         range_diff = diff_plot[mask]
-        # Convert to plain Python float to avoid np.float64(...) in CSV
         mae_value = float(np.mean(np.abs(range_diff[~np.isnan(range_diff)])))
         mae_ranges.append((start_date, end_date, mae_value))
     return mae_ranges
 
-# ---------------------------------------------------------------------
-# Parallelized Training Function
-# ---------------------------------------------------------------------
 def train_model_with_lr(gamma_value):
-    """
-    1) Builds an SVR with gamma=gamma_value.
-    2) Applies attention to trainX -> trains the model.
-    3) Predicts on train/test sets (with attention).
-    4) Calculates date-range-based MAE.
-    Returns: (gamma_value, mae_ranges)
-    """
-    # 1) Build the SVR model
+
     model = build_model(gamma_value)
 
-    # 2) Apply attention to training data
     att_trainX = attention_layer.apply_attention(trainX).reshape(-1, 1)
     model.fit(att_trainX, trainY)
 
-    # 3) Predict
     att_trainPredict = model.predict(att_trainX)
     att_testX = attention_layer.apply_attention(testX).reshape(-1, 1)
     att_testPredict = model.predict(att_testX)
 
-    # 4) Invert the scaling
     trainPredict = scaler.inverse_transform(att_trainPredict.reshape(-1, 1))
     testPredict = scaler.inverse_transform(att_testPredict.reshape(-1, 1))
     trainY_inv = scaler.inverse_transform(trainY.reshape(1, -1))
@@ -189,11 +125,7 @@ def train_model_with_lr(gamma_value):
     mae_ranges = calculate_mae(diff_plot, date_ranges)
     return (gamma_value, mae_ranges)
 
-# ---------------------------------------------------------------------
-# Hyperparameter Search & MAE Logging (PARALLEL)
-# ---------------------------------------------------------------------
 if __name__ == '__main__':
-    # We'll use a typical set of gamma values for RBF SVR
     gamma_values = [1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1]
     n_jobs = multiprocessing.cpu_count()
 
@@ -201,19 +133,14 @@ if __name__ == '__main__':
 
     results = Parallel(n_jobs=n_jobs)(delayed(train_model_with_lr)(g) for g in gamma_values)
 
-    # Save results to CSV
     mae_results_path = os.path.join(output_folder, f'{stock_symbol}_mae_results.csv')
     results_df = pd.DataFrame(results, columns=['Gamma', 'MAE Ranges'])
     results_df.to_csv(mae_results_path, index=False)
     print(f"MAE results saved to {mae_results_path}")
 
-    # ---------------------------------------------------------------------
-    # Post-Processing the MAE Results
-    # ---------------------------------------------------------------------
     file_path = mae_results_path
     df_csv = pd.read_csv(file_path)
 
-    # Transform the "MAE Ranges" column into separate columns
     transformed_data = {'Gamma': df_csv['Gamma']}
     columns_set = set()
 
@@ -234,7 +161,6 @@ if __name__ == '__main__':
     transformed_df = pd.DataFrame(transformed_data)
     transformed_df.to_csv(file_path, index=False)
 
-    # If you really have 2 extra lines in your CSV, keep skipfooter=2; otherwise remove or set skipfooter=0
     df_csv = pd.read_csv(file_path, skipfooter=2, engine='python')
     mean_values = df_csv.iloc[:, 1:].mean(axis=1)
     median_values = df_csv.iloc[:, 1:].median(axis=1)
@@ -258,9 +184,6 @@ if __name__ == '__main__':
     print(f"\nBest Gamma by Mean: {min_mean_gamma}, Value: {min_mean_value}")
     print(f"Best Gamma by Median: {min_median_gamma}, Value: {min_median_value}")
 
-    # ---------------------------------------------------------------------
-    # Retrain with Best Gamma and Visualize (SVR + Attention)
-    # ---------------------------------------------------------------------
     df_final = pd.read_csv(data_path)
     Gamma = min_median_gamma
 
@@ -320,7 +243,6 @@ if __name__ == '__main__':
     average_error_final = np.mean(np.abs(diff_plot_final[~np.isnan(diff_plot_final)]))
     print(f"\nFinal model average error (MAE): {average_error_final:.4f}")
 
-    # Plot actual vs. predicted
     fig_final, (ax1_final, ax2_final) = plt.subplots(2, 1, figsize=(12, 12), sharex=True)
 
     ax1_final.plot(
