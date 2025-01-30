@@ -6,38 +6,30 @@ import pandas as pd
 from datetime import datetime
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
-
-# Keras / TensorFlow
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Conv1D, Dense, Flatten
 from tensorflow.keras.optimizers import Adam
-
 from joblib import Parallel, delayed
 import multiprocessing
 import matplotlib.dates as mdates
 
-# ---------------------------------------------------------------------
-# Global Variables and Configuration
-# ---------------------------------------------------------------------
-stock_symbol = "PFE"
-output_folder = stock_symbol  # Folder that has the same name as the stock symbol
 
-# Ensure the folder exists (optional safety check)
+stock_symbol = ""
+output_folder = stock_symbol 
+
+
 os.makedirs(output_folder, exist_ok=True)
 
-# Read the cleaned CSV from the symbol folder
+
 data_path = os.path.join(output_folder, f'cleaned_{stock_symbol}_data.csv')
 df = pd.read_csv(data_path)
-df['Date'] = pd.to_datetime(df['Date'])  # Ensure 'Date' column is datetime
+df['Date'] = pd.to_datetime(df['Date'])  
 
-column_name = 'adjusted_close_price'  # Column to be modeled
+column_name = 'adjusted_close_price' 
 scaler = MinMaxScaler(feature_range=(0, 1))
 scaled_data = scaler.fit_transform(df[[column_name]].values)
 
-# ---------------------------------------------------------------------
-# Dataset Creation
-# ---------------------------------------------------------------------
 def create_dataset(data, look_back=1):
     """
     Converts a 1D time series into a dataset suitable for a CNN,
@@ -45,11 +37,8 @@ def create_dataset(data, look_back=1):
     """
     X, Y = [], []
     for i in range(len(data) - look_back):
-        # The feature vector is the previous 'look_back' values
         X.append(data[i:(i + look_back), 0])
-        # The label is the value right after that window
         Y.append(data[i + look_back, 0])
-    # Reshape X to (samples, look_back, 1) for Conv1D
     X = np.array(X).reshape(-1, look_back, 1)
     Y = np.array(Y)
     return X, Y
@@ -57,15 +46,12 @@ def create_dataset(data, look_back=1):
 look_back = 30
 X, Y = create_dataset(scaled_data, look_back)
 
-# Train/Test Split
+
 train_size = int(len(X) * 0.8)
 test_size = len(X) - train_size
 trainX, testX = X[:train_size], X[train_size:]
 trainY, testY = Y[:train_size], Y[train_size:]
 
-# ---------------------------------------------------------------------
-# CNN Model (Build & Compile)
-# ---------------------------------------------------------------------
 def build_model(learning_rate):
     model = Sequential([
         Conv1D(filters=32, kernel_size=3, activation='relu', input_shape=(look_back, 1)),
@@ -78,9 +64,6 @@ def build_model(learning_rate):
     )
     return model
 
-# ---------------------------------------------------------------------
-# Date Ranges for MAE Calculation
-# ---------------------------------------------------------------------
 date_ranges = [
     ('2015-01-01', '2018-12-31'),
     ('2018-01-01', '2020-12-31'),
@@ -88,9 +71,6 @@ date_ranges = [
     ('2022-01-01', '2024-12-31')
 ]
 
-# ---------------------------------------------------------------------
-# MAE Calculation Function
-# ---------------------------------------------------------------------
 def calculate_mae(diff_plot, date_ranges):
     """
     Calculates MAE in diff_plot for each start-end date in date_ranges,
@@ -101,15 +81,12 @@ def calculate_mae(diff_plot, date_ranges):
         mask = (df['Date'] >= start_date) & (df['Date'] <= end_date)
         range_diff = diff_plot[mask]
 
-        # Convert to float to avoid np.float64(...) in your CSV
         mae_value = float(np.mean(np.abs(range_diff[~np.isnan(range_diff)])))
         mae_ranges.append((start_date, end_date, mae_value))
 
     return mae_ranges
 
-# ---------------------------------------------------------------------
-# Parallelized Training Function
-# ---------------------------------------------------------------------
+
 def train_model_with_lr(lr):
     """
     1) Builds a CNN with the given learning rate.
@@ -118,10 +95,9 @@ def train_model_with_lr(lr):
     4) Calculates date-range-based MAE.
     Returns: (lr, mae_ranges) as Python-literal-friendly data.
     """
-    # Build the CNN model
+
     model = build_model(lr)
 
-    # Train quietly for a fixed epoch count, e.g., 50
     model.fit(
         trainX, trainY,
         epochs=50,
@@ -129,24 +105,24 @@ def train_model_with_lr(lr):
         verbose=0
     )
 
-    # Generate predictions
+
     trainPredict = model.predict(trainX)
     testPredict = model.predict(testX)
 
-    # Invert predictions and labels
+
     trainPredict = scaler.inverse_transform(trainPredict)
     testPredict = scaler.inverse_transform(testPredict)
     trainY_inv = scaler.inverse_transform(trainY.reshape(-1, 1))
     testY_inv = scaler.inverse_transform(testY.reshape(-1, 1))
 
-    # Prepare the difference array for MAE
+
     diff_train = trainPredict[:, 0] - trainY_inv[:, 0]
     diff_test = testPredict[:, 0] - testY_inv[:, 0]
 
     diff_plot = np.empty_like(scaled_data)
     diff_plot[:, :] = np.nan
 
-    # Align predictions with the actual data timeline
+
     trainPredictStart = look_back
     trainPredictEnd = trainPredictStart + len(diff_train)
     testPredictStart = trainPredictEnd
@@ -157,12 +133,10 @@ def train_model_with_lr(lr):
 
     mae_ranges = calculate_mae(diff_plot, date_ranges)
 
-    # Return the learning rate and a Python-literal-friendly list of tuples
+
     return (lr, mae_ranges)
 
-# ---------------------------------------------------------------------
-# Hyperparameter Search & MAE Logging (PARALLEL)
-# ---------------------------------------------------------------------
+
 if __name__ == '__main__':
     learning_rates = [
         0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 
@@ -175,28 +149,23 @@ if __name__ == '__main__':
 
     results = Parallel(n_jobs=n_jobs)(delayed(train_model_with_lr)(lr) for lr in learning_rates)
 
-    # Save results to CSV inside the stock symbol folder
     mae_results_path = os.path.join(output_folder, f'{stock_symbol}_mae_results.csv')
     results_df = pd.DataFrame(results, columns=['Learning Rate', 'MAE Ranges'])
     results_df.to_csv(mae_results_path, index=False)
     print(f"MAE results saved to {mae_results_path}")
 
-# ---------------------------------------------------------------------
-# Post-Processing the MAE Results
-# ---------------------------------------------------------------------
 
-# Read the results CSV again
+
 df_csv = pd.read_csv(mae_results_path)
 
-# We'll transform the "MAE Ranges" column into multiple columns
+
 transformed_data = {'Learning Rate': df_csv['Learning Rate']}
 columns_set = set()
 
 for index, row in df_csv.iterrows():
     mae_str = row['MAE Ranges']
-    # Parse as Python literal: e.g. "[('2015-01-01', '2018-12-31', 1.23), ...]"
     try:
-        mae_list = ast.literal_eval(mae_str)  # <--- Use literal_eval instead of json
+        mae_list = ast.literal_eval(mae_str)  
         for (start_date, end_date, mae_value) in mae_list:
             col_name = f'{start_date} to {end_date}'
             columns_set.add(col_name)
@@ -208,24 +177,21 @@ for index, row in df_csv.iterrows():
         print(f"Problematic data: {mae_str}")
         continue
 
-# Convert transformed_data to a DataFrame and overwrite the CSV
 transformed_df = pd.DataFrame(transformed_data)
 transformed_df.to_csv(mae_results_path, index=False)
 
-# Now we have columns for each date range. We'll compute Mean/Median of those columns.
 df_csv = pd.read_csv(mae_results_path)
 
-# The first column is "Learning Rate", so the subsequent columns are the date ranges
-date_range_cols = df_csv.columns[1:]  # from 1 onward
+date_range_cols = df_csv.columns[1:] 
 
-# Compute row-wise Mean & Median
+
 df_csv['Mean'] = df_csv[date_range_cols].mean(axis=1)
 df_csv['Median'] = df_csv[date_range_cols].median(axis=1)
 
-# Save it back
+
 df_csv.to_csv(mae_results_path, index=False)
 
-# Identify the row with the lowest Mean
+
 if df_csv['Mean'].isna().all():
     print("All Mean values are NaN—cannot compute best LR by Mean.")
     min_mean_learning_rate = None
@@ -235,7 +201,7 @@ else:
     min_mean_learning_rate = min_mean_row['Learning Rate']
     min_mean_value = min_mean_row['Mean']
 
-# Identify the row with the lowest Median
+
 if df_csv['Median'].isna().all():
     print("All Median values are NaN—cannot compute best LR by Median.")
     min_median_learning_rate = None
@@ -248,11 +214,7 @@ else:
 print(f"\nBest LR by Mean: {min_mean_learning_rate}, Value: {min_mean_value}")
 print(f"Best LR by Median: {min_median_learning_rate}, Value: {min_median_value}")
 
-# ---------------------------------------------------------------------
-# Retrain with Best LR and Visualize (CNN)
-# ---------------------------------------------------------------------
 
-# For safety, pick whichever metric you prefer:
 LR = min_median_learning_rate if min_median_learning_rate is not None else 0.001
 
 df_final = pd.read_csv(data_path)
@@ -324,7 +286,7 @@ diff_plot_final[testPredictStart:testPredictEnd, 0] = diff_test_final
 average_error_final = np.mean(np.abs(diff_plot_final[~np.isnan(diff_plot_final)]))
 print(f"\nFinal model average error (MAE): {average_error_final:.4f}")
 
-# Plot actual vs predicted
+
 fig_final, (ax1_final, ax2_final) = plt.subplots(2, 1, figsize=(12, 12), sharex=True)
 
 ax1_final.plot(
