@@ -1,132 +1,69 @@
 import os
+import re
+import ast
+import numpy as np
 import pandas as pd
-import yfinance as yf
-import requests
 from datetime import datetime
 import matplotlib.pyplot as plt
-import numpy as np
-
 from sklearn.preprocessing import MinMaxScaler
 import tensorflow as tf
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Dense, Layer, TimeDistributed
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv1D, Dense, Flatten
 from tensorflow.keras.optimizers import Adam
-
 from joblib import Parallel, delayed
 import multiprocessing
 import matplotlib.dates as mdates
-import ast
 
 
+stock_symbol = ""
+output_folder = stock_symbol 
 
 
-# ---------------------------------------------------------------------
-# Global Variables and Configuration
-# ---------------------------------------------------------------------
-stock_symbol = "PFE"
-output_folder = stock_symbol  # Folder that has the same name as the stock symbol
-
-# If the folder doesn't exist yet, create it (optional)
 os.makedirs(output_folder, exist_ok=True)
 
-# Read the cleaned data from inside that folder
+
 data_path = os.path.join(output_folder, f'cleaned_{stock_symbol}_data.csv')
 df = pd.read_csv(data_path)
-df['Date'] = pd.to_datetime(df['Date'])  # Ensure 'Date' column is datetime
+df['Date'] = pd.to_datetime(df['Date'])  
 
-column_name = 'adjusted_close_price'  # Column to be modeled
+column_name = 'adjusted_close_price' 
 scaler = MinMaxScaler(feature_range=(0, 1))
 scaled_data = scaler.fit_transform(df[[column_name]].values)
 
-# ---------------------------------------------------------------------
-# Dataset Creation
-# ---------------------------------------------------------------------
 def create_dataset(data, look_back=1):
     """
-    Converts a 1D time series into a dataset suitable for an ANN,
-    taking 'look_back' timesteps as X and the next timestep as Y.
+    Converts a 1D time series into a dataset suitable for a CNN,
+    shaping each sample as (look_back, 1).
     """
     X, Y = [], []
     for i in range(len(data) - look_back):
         X.append(data[i:(i + look_back), 0])
         Y.append(data[i + look_back, 0])
-    return np.array(X), np.array(Y)
+    X = np.array(X).reshape(-1, look_back, 1)
+    Y = np.array(Y)
+    return X, Y
 
 look_back = 30
 X, Y = create_dataset(scaled_data, look_back)
-# Reshape for (samples, time_steps, 1) so we can apply TimeDistributed + Attention
-X = X.reshape((X.shape[0], X.shape[1], 1))  # (samples, look_back, 1)
 
-# Train/Test Split
+
 train_size = int(len(X) * 0.8)
 test_size = len(X) - train_size
 trainX, testX = X[:train_size], X[train_size:]
 trainY, testY = Y[:train_size], Y[train_size:]
 
-# ---------------------------------------------------------------------
-# Attention Layer Definition
-# ---------------------------------------------------------------------
-class AttentionLayer(tf.keras.layers.Layer):
-    """
-    A custom Attention Layer that computes alignment scores and
-    returns a weighted sum across the time dimension.
-    """
-    def __init__(self, **kwargs):
-        super(AttentionLayer, self).__init__(**kwargs)
-
-    def build(self, input_shape):
-        self.W = self.add_weight(
-            name="att_weight",
-            shape=(input_shape[-1], input_shape[-1]),
-            initializer="glorot_uniform",
-            trainable=True
-        )
-        self.b = self.add_weight(
-            name="att_bias",
-            shape=(input_shape[-1],),
-            initializer="zeros",
-            trainable=True
-        )
-        super(AttentionLayer, self).build(input_shape)
-
-    def call(self, x):
-        # x shape: (batch, time, features)
-        e = tf.keras.backend.tanh(tf.keras.backend.dot(x, self.W) + self.b)
-        a = tf.keras.backend.softmax(e, axis=1)  # softmax over 'time' dimension
-        output = x * a
-        return tf.keras.backend.sum(output, axis=1)
-
-# ---------------------------------------------------------------------
-# Build & Compile the Model (ANN version)
-# ---------------------------------------------------------------------
-def build_model(look_back, learning_rate):
-    """
-    Builds and compiles an ANN model with:
-      1. TimeDistributed Dense across timesteps
-      2. Custom Attention layer
-      3. Final Dense(1)
-    """
-    # Input shape: (batch_size, look_back, 1)
-    input_layer = Input(shape=(look_back, 1))
-    
-    # TimeDistributed Dense replaces the LSTM
-    # This applies a Dense layer to each timestep independently
-    time_dist_layer = TimeDistributed(Dense(50, activation='relu'))(input_layer)
-
-    # Apply the Attention layer
-    attention_layer = AttentionLayer()(time_dist_layer)
-
-    # Final output layer
-    dense_layer = Dense(1)(attention_layer)
-
-    # Compile
-    model = Model(inputs=input_layer, outputs=dense_layer)
-    model.compile(optimizer=Adam(learning_rate=learning_rate), loss='mean_squared_error')
+def build_model(learning_rate):
+    model = Sequential([
+        Conv1D(filters=32, kernel_size=3, activation='relu', input_shape=(look_back, 1)),
+        Flatten(),
+        Dense(1)
+    ])
+    model.compile(
+        optimizer=Adam(learning_rate=learning_rate),
+        loss='mean_squared_error'
+    )
     return model
 
-# ---------------------------------------------------------------------
-# Date Ranges for MAE Calculation
-# ---------------------------------------------------------------------
 date_ranges = [
     ('2015-01-01', '2018-12-31'),
     ('2018-01-01', '2020-12-31'),
@@ -134,308 +71,259 @@ date_ranges = [
     ('2022-01-01', '2024-12-31')
 ]
 
-# ---------------------------------------------------------------------
-# MAE Calculation Function
-# ---------------------------------------------------------------------
 def calculate_mae(diff_plot, date_ranges):
     """
-    Calculates MAE in diff_plot for each start-end date in date_ranges.
-    Returns a list of tuples: (start_date, end_date, mae_as_float)
+    Calculates MAE in diff_plot for each start-end date in date_ranges,
+    returning tuples of (start_date, end_date, mae) with plain floats.
     """
     mae_ranges = []
     for start_date, end_date in date_ranges:
         mask = (df['Date'] >= start_date) & (df['Date'] <= end_date)
         range_diff = diff_plot[mask]
 
-        # Convert to plain float to avoid np.float64(...) in the CSV
         mae_value = float(np.mean(np.abs(range_diff[~np.isnan(range_diff)])))
         mae_ranges.append((start_date, end_date, mae_value))
+
     return mae_ranges
 
-# ---------------------------------------------------------------------
-# Parallelized Training Function
-# ---------------------------------------------------------------------
+
 def train_model_with_lr(lr):
     """
-    Trains a model with the given learning rate (lr),
-    then calculates the MAE ranges for each date range.
-    
-    Returns a tuple: (lr, mae_ranges) with float values only.
+    1) Builds a CNN with the given learning rate.
+    2) Trains on trainX, trainY for a fixed number of epochs/batch_size.
+    3) Predicts on train/test sets.
+    4) Calculates date-range-based MAE.
+    Returns: (lr, mae_ranges) as Python-literal-friendly data.
     """
-    # Build the model for this LR
-    model = build_model(look_back, lr)
-    
-    # Train quietly
+
+    model = build_model(lr)
+
     model.fit(
         trainX, trainY,
-        epochs=150,
-        batch_size=100,
-        validation_data=(testX, testY),
+        epochs=50,
+        batch_size=64,
         verbose=0
     )
-    
-    # Predictions
+
+
     trainPredict = model.predict(trainX)
     testPredict = model.predict(testX)
-    
-    # Invert predictions
+
+
     trainPredict = scaler.inverse_transform(trainPredict)
     testPredict = scaler.inverse_transform(testPredict)
-    trainY_inv = scaler.inverse_transform([trainY])
-    testY_inv = scaler.inverse_transform([testY])
-    
-    # Prepare the difference array for MAE
-    diff_train = trainPredict[:, 0] - trainY_inv[0][:len(trainPredict)]
-    diff_test = testPredict[:, 0] - testY_inv[0][:len(testPredict)]
-    
+    trainY_inv = scaler.inverse_transform(trainY.reshape(-1, 1))
+    testY_inv = scaler.inverse_transform(testY.reshape(-1, 1))
+
+
+    diff_train = trainPredict[:, 0] - trainY_inv[:, 0]
+    diff_test = testPredict[:, 0] - testY_inv[:, 0]
+
     diff_plot = np.empty_like(scaled_data)
     diff_plot[:, :] = np.nan
 
+
     trainPredictStart = look_back
-    trainPredictEnd = trainPredictStart + len(trainPredict)
+    trainPredictEnd = trainPredictStart + len(diff_train)
     testPredictStart = trainPredictEnd
-    testPredictEnd = testPredictStart + len(testPredict)
+    testPredictEnd = testPredictStart + len(diff_test)
 
     diff_plot[trainPredictStart:trainPredictEnd, 0] = diff_train
     diff_plot[testPredictStart:testPredictEnd, 0] = diff_test
 
-    # Calculate MAE by date range (as floats)
     mae_ranges = calculate_mae(diff_plot, date_ranges)
-    
+
+
     return (lr, mae_ranges)
 
-# ---------------------------------------------------------------------
-# Hyperparameter Search & MAE Logging (PARALLEL)
-# ---------------------------------------------------------------------
+
 if __name__ == '__main__':
-    # You can adjust the range or size of learning_rates as needed
-    learning_rates = np.linspace(0.000001, 0.00005, 10)
+    learning_rates = [
+        0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 
+        0.0006, 0.0007, 0.0008, 0.0009, 0.001, 
+        0.002, 0.005, 0.01, 0.02, 0.05, 
+        0.1, 0.15, 0.2, 0.25, 0.5
+    ]
     n_jobs = multiprocessing.cpu_count()
+    print(f"Starting parallel search across {len(learning_rates)} CNN learning rates, using {n_jobs} CPUs...")
 
-    print(f"Starting parallel search across {len(learning_rates)} learning rates, using {n_jobs} CPUs...")
-
-    # Train each LR in parallel
     results = Parallel(n_jobs=n_jobs)(delayed(train_model_with_lr)(lr) for lr in learning_rates)
 
-    # Save results to a CSV inside the stock symbol folder
     mae_results_path = os.path.join(output_folder, f'{stock_symbol}_mae_results.csv')
     results_df = pd.DataFrame(results, columns=['Learning Rate', 'MAE Ranges'])
     results_df.to_csv(mae_results_path, index=False)
     print(f"MAE results saved to {mae_results_path}")
 
-    # ---------------------------------------------------------------------
-    # Post-Processing the MAE Results
-    # ---------------------------------------------------------------------
-    file_path = mae_results_path  # We'll read from the same path in the subfolder
-    df_csv = pd.read_csv(file_path)
 
-    # Transform the "MAE Ranges" column into separate columns
-    transformed_data = {'Learning Rate': df_csv['Learning Rate']}
-    columns_set = set()
 
-    for index, row in df_csv.iterrows():
-        # 'MAE Ranges' is a Python-literal string, e.g. "[('2015-01-01','2018-12-31', 1.234), ...]"
-        mae_list = ast.literal_eval(row['MAE Ranges'])
-        for date_range in mae_list:
-            start_date, end_date, mae_value = date_range
+df_csv = pd.read_csv(mae_results_path)
+
+
+transformed_data = {'Learning Rate': df_csv['Learning Rate']}
+columns_set = set()
+
+for index, row in df_csv.iterrows():
+    mae_str = row['MAE Ranges']
+    try:
+        mae_list = ast.literal_eval(mae_str)  
+        for (start_date, end_date, mae_value) in mae_list:
             col_name = f'{start_date} to {end_date}'
             columns_set.add(col_name)
             if col_name not in transformed_data:
                 transformed_data[col_name] = [None] * len(df_csv)
             transformed_data[col_name][index] = mae_value
+    except (SyntaxError, ValueError) as e:
+        print(f"Error processing row {index}: {e}")
+        print(f"Problematic data: {mae_str}")
+        continue
 
-    # Ensure all columns exist
-    for col in columns_set:
-        if col not in transformed_data:
-            transformed_data[col] = [None] * len(df_csv)
+transformed_df = pd.DataFrame(transformed_data)
+transformed_df.to_csv(mae_results_path, index=False)
 
-    transformed_df = pd.DataFrame(transformed_data)
-    transformed_df.to_csv(file_path, index=False)
+df_csv = pd.read_csv(mae_results_path)
 
-    # -- If you actually have 2 extra lines at bottom, keep skipfooter=2;
-    # -- otherwise remove it or set skipfooter=0
-    df_csv = pd.read_csv(file_path, skipfooter=2, engine='python')
+date_range_cols = df_csv.columns[1:] 
 
-    mean_values = df_csv.iloc[:, 1:].mean(axis=1)
-    median_values = df_csv.iloc[:, 1:].median(axis=1)
 
-    df_csv['Mean'] = mean_values
-    df_csv['Median'] = median_values
-    df_csv.to_csv(file_path, index=False)
+df_csv['Mean'] = df_csv[date_range_cols].mean(axis=1)
+df_csv['Median'] = df_csv[date_range_cols].median(axis=1)
 
-    # Re-read CSV and compute final mean/median
-    df_csv = pd.read_csv(file_path)
-    df_csv['Mean'] = df_csv.iloc[:, 1:-2].mean(axis=1)
-    df_csv['Median'] = df_csv.iloc[:, 1:-2].median(axis=1)
 
+df_csv.to_csv(mae_results_path, index=False)
+
+
+if df_csv['Mean'].isna().all():
+    print("All Mean values are NaN—cannot compute best LR by Mean.")
+    min_mean_learning_rate = None
+    min_mean_value = None
+else:
     min_mean_row = df_csv.loc[df_csv['Mean'].idxmin()]
-    min_median_row = df_csv.loc[df_csv['Median'].idxmin()]
-
     min_mean_learning_rate = min_mean_row['Learning Rate']
     min_mean_value = min_mean_row['Mean']
+
+
+if df_csv['Median'].isna().all():
+    print("All Median values are NaN—cannot compute best LR by Median.")
+    min_median_learning_rate = None
+    min_median_value = None
+else:
+    min_median_row = df_csv.loc[df_csv['Median'].idxmin()]
     min_median_learning_rate = min_median_row['Learning Rate']
     min_median_value = min_median_row['Median']
 
-    print(f"\nBest LR by Mean: {min_mean_learning_rate}, Value: {min_mean_value}")
-    print(f"Best LR by Median: {min_median_learning_rate}, Value: {min_median_value}")
+print(f"\nBest LR by Mean: {min_mean_learning_rate}, Value: {min_mean_value}")
+print(f"Best LR by Median: {min_median_learning_rate}, Value: {min_median_value}")
 
-    # ---------------------------------------------------------------------
-    # Retrain with Best LR and Visualize (ANN)
-    # ---------------------------------------------------------------------
-    df_final = pd.read_csv(data_path)  # from the subfolder
-    LR = min_median_learning_rate
 
-    df_final['Date'] = pd.to_datetime(df_final['Date'])
-    column_name = 'adjusted_close_price'
-    scaler_final = MinMaxScaler(feature_range=(0, 1))
-    scaled_data_final = scaler_final.fit_transform(df_final[[column_name]].values)
+LR = min_median_learning_rate if min_median_learning_rate is not None else 0.001
 
-    def create_dataset_final(data, look_back=1):
-        """
-        Helper function for building X, Y arrays with a sliding window.
-        """
-        X_out, Y_out = [], []
-        for i in range(len(data) - look_back):
-            X_out.append(data[i:(i + look_back), 0])
-            Y_out.append(data[i + look_back, 0])
-        return np.array(X_out), np.array(Y_out)
+df_final = pd.read_csv(data_path)
+df_final['Date'] = pd.to_datetime(df_final['Date'])
 
-    look_back = 30
-    X_final, Y_final = create_dataset_final(scaled_data_final, look_back)
-    X_final = np.reshape(X_final, (X_final.shape[0], X_final.shape[1], 1))
+scaler_final = MinMaxScaler(feature_range=(0, 1))
+scaled_data_final = scaler_final.fit_transform(df_final[[column_name]].values)
 
-    train_size = int(len(X_final) * 0.8)
-    test_size = len(X_final) - train_size
-    trainX_final, testX_final = X_final[:train_size], X_final[train_size:]
-    trainY_final, testY_final = Y_final[:train_size], Y_final[train_size:]
+def create_dataset_final(data, look_back=1):
+    X_out, Y_out = [], []
+    for i in range(len(data) - look_back):
+        X_out.append(data[i:(i + look_back), 0])
+        Y_out.append(data[i + look_back, 0])
+    X_out = np.array(X_out).reshape(-1, look_back, 1)
+    Y_out = np.array(Y_out)
+    return X_out, Y_out
 
-    # Same custom Attention layer
-    class AttentionLayer(tf.keras.layers.Layer):
-        def __init__(self, **kwargs):
-            super(AttentionLayer, self).__init__(**kwargs)
+X_final, Y_final = create_dataset_final(scaled_data_final, look_back)
+train_size = int(len(X_final) * 0.8)
+test_size = len(X_final) - train_size
+trainX_final, testX_final = X_final[:train_size], X_final[train_size:]
+trainY_final, testY_final = Y_final[:train_size], Y_final[train_size:]
 
-        def build(self, input_shape):
-            self.W = self.add_weight(
-                name="att_weight",
-                shape=(input_shape[-1], input_shape[-1]),
-                initializer="glorot_uniform",
-                trainable=True
-            )
-            self.b = self.add_weight(
-                name="att_bias",
-                shape=(input_shape[-1],),
-                initializer="zeros",
-                trainable=True
-            )
-            super(AttentionLayer, self).build(input_shape)
+def build_final_model(learning_rate):
+    model = Sequential()
+    model.add(Conv1D(filters=32, kernel_size=3, activation='relu', input_shape=(look_back, 1)))
+    model.add(Flatten())
+    model.add(Dense(1))
+    model.compile(optimizer=Adam(learning_rate=learning_rate), loss='mean_squared_error')
+    return model
 
-        def call(self, x):
-            e = tf.keras.backend.tanh(tf.keras.backend.dot(x, self.W) + self.b)
-            a = tf.keras.backend.softmax(e, axis=1)
-            output = x * a
-            return tf.keras.backend.sum(output, axis=1)
+model_final = build_final_model(LR)
+model_final.fit(
+    trainX_final, trainY_final,
+    epochs=50,
+    batch_size=64,
+    verbose=2
+)
 
-    # Build the final ANN model (replacing LSTM with TimeDistributed Dense)
-    input_layer_final = Input(shape=(look_back, 1))
-    time_dist_layer_final = TimeDistributed(Dense(50, activation='relu'))(input_layer_final)
-    attention_layer_final = AttentionLayer()(time_dist_layer_final)
-    dense_layer_final = Dense(1)(attention_layer_final)
-    model_final = Model(inputs=input_layer_final, outputs=dense_layer_final)
+trainPredict_final = model_final.predict(trainX_final)
+testPredict_final = model_final.predict(testX_final)
 
-    model_final.compile(optimizer=Adam(learning_rate=LR), loss='mean_squared_error')
-    model_final.summary()
+trainPredict_final = scaler_final.inverse_transform(trainPredict_final)
+testPredict_final = scaler_final.inverse_transform(testPredict_final)
+trainY_inv_final = scaler_final.inverse_transform(trainY_final.reshape(-1, 1))
+testY_inv_final = scaler_final.inverse_transform(testY_final.reshape(-1, 1))
 
-    history_final = model_final.fit(
-        trainX_final, trainY_final,
-        epochs=150,
-        batch_size=100,
-        validation_data=(testX_final, testY_final),
-        verbose=2
-    )
+trainPredictStart = look_back
+trainPredictEnd = trainPredictStart + len(trainPredict_final)
+testPredictStart = trainPredictEnd
+testPredictEnd = testPredictStart + len(testPredict_final)
 
-    # Predictions
-    trainPredict_final = model_final.predict(trainX_final)
-    testPredict_final = model_final.predict(testX_final)
+trainPredictPlot = np.empty_like(scaled_data_final)
+trainPredictPlot[:, :] = np.nan
+trainPredictPlot[trainPredictStart:trainPredictEnd, 0] = trainPredict_final[:, 0]
 
-    # Invert predictions
-    trainPredict_final = scaler_final.inverse_transform(trainPredict_final)
-    testPredict_final = scaler_final.inverse_transform(testPredict_final)
-    trainY_inv_final = scaler_final.inverse_transform([trainY_final])
-    testY_inv_final = scaler_final.inverse_transform([testY_final])
+testPredictPlot = np.empty_like(scaled_data_final)
+testPredictPlot[:, :] = np.nan
+testPredictPlot[testPredictStart:testPredictEnd, 0] = testPredict_final[:, 0]
 
-    trainPredictStart = look_back
-    trainPredictEnd = trainPredictStart + len(trainPredict_final)
-    testPredictStart = trainPredictEnd
-    testPredictEnd = testPredictStart + len(testPredict_final)
+diff_train_final = trainPredict_final[:, 0] - trainY_inv_final[:, 0]
+diff_test_final = testPredict_final[:, 0] - testY_inv_final[:, 0]
+diff_plot_final = np.empty_like(scaled_data_final)
+diff_plot_final[:, :] = np.nan
 
-    trainPredictPlot = np.empty_like(scaled_data_final)
-    trainPredictPlot[:, :] = np.nan
-    trainPredictPlot[trainPredictStart:trainPredictEnd, 0] = trainPredict_final[:, 0]
+diff_plot_final[trainPredictStart:trainPredictEnd, 0] = diff_train_final
+diff_plot_final[testPredictStart:testPredictEnd, 0] = diff_test_final
 
-    testPredictPlot = np.empty_like(scaled_data_final)
-    testPredictPlot[:, :] = np.nan
-    testPredictPlot[testPredictStart:testPredictEnd, 0] = testPredict_final[:, 0]
+average_error_final = np.mean(np.abs(diff_plot_final[~np.isnan(diff_plot_final)]))
+print(f"\nFinal model average error (MAE): {average_error_final:.4f}")
 
-    diff_train_final = trainPredict_final[:, 0] - trainY_inv_final[0][:len(trainPredict_final)]
-    diff_test_final = testPredict_final[:, 0] - testY_inv_final[0][:len(testPredict_final)]
-    diff_plot_final = np.empty_like(scaled_data_final)
-    diff_plot_final[:, :] = np.nan
 
-    diff_plot_final[trainPredictStart:trainPredictEnd, 0] = diff_train_final
-    diff_plot_final[testPredictStart:testPredictEnd, 0] = diff_test_final
+fig_final, (ax1_final, ax2_final) = plt.subplots(2, 1, figsize=(12, 12), sharex=True)
 
-    # Average error
-    average_error_final = np.mean(np.abs(diff_plot_final[~np.isnan(diff_plot_final)]))
-    print(f"\nFinal model average error (MAE): {average_error_final:.4f}")
+ax1_final.plot(
+    df_final['Date'],
+    scaler_final.inverse_transform(scaled_data_final),
+    label='Actual Adj Close',
+    color='b'
+)
+ax1_final.plot(
+    df_final['Date'], trainPredictPlot,
+    label='Train Predict',
+    color='r'
+)
+ax1_final.plot(
+    df_final['Date'], testPredictPlot,
+    label='Test Predict',
+    color='g'
+)
+ax1_final.set_title('Actual vs Predicted Stock Prices (CNN)')
+ax1_final.set_ylabel('Adjusted Close Price')
+ax1_final.legend()
 
-    # Plot actual vs. predicted
-    fig_final, (ax1_final, ax2_final) = plt.subplots(2, 1, figsize=(12, 12), sharex=True)
+ax2_final.plot(
+    df_final['Date'], diff_plot_final,
+    label='Difference (Predicted - Actual)',
+    color='m'
+)
+ax2_final.axhline(y=0, color='k')
+ax2_final.set_title('Difference Between Actual and Predicted Stock Prices')
+ax2_final.set_xlabel('Date')
+ax2_final.set_ylabel('Difference')
+ax2_final.legend()
 
-    ax1_final.plot(
-        df_final['Date'],
-        scaler_final.inverse_transform(scaled_data_final),
-        label='Actual Adj Close',
-        color='b'
-    )
-    ax1_final.plot(
-        df_final['Date'], trainPredictPlot,
-        label='Train Predict',
-        color='r'
-    )
-    ax1_final.plot(
-        df_final['Date'], testPredictPlot,
-        label='Test Predict',
-        color='g'
-    )
-    ax1_final.set_title('Actual vs Predicted Stock Prices (No Extrapolation)')
-    ax1_final.set_ylabel('Adjusted Close Price')
-    ax1_final.legend()
+ax2_final.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
+ax2_final.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
 
-    ax2_final.plot(
-        df_final['Date'], diff_plot_final,
-        label='Difference (Predicted - Actual)',
-        color='m'
-    )
-    ax2_final.axhline(y=0, color='k')
-    ax2_final.set_title('Difference Between Actual and Predicted Stock Prices')
-    ax2_final.set_xlabel('Date')
-    ax2_final.set_ylabel('Difference')
-    ax2_final.legend()
-
-    ax2_final.xaxis.set_major_locator(mdates.MonthLocator(interval=6))
-    ax2_final.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.show()
-
-    # Plot training and validation loss
-    plt.figure(figsize=(12, 6))
-    plt.plot(history_final.history['loss'], label='Training Loss')
-    plt.plot(history_final.history['val_loss'], label='Validation Loss')
-    plt.title('Model Loss (No Extrapolation) - ANN')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.show()
-
-    print("\nExecution complete with parallelized hyperparameter search, using an ANN + Attention (instead of LSTM).")
+print("\nExecution complete with parallelized hyperparameter search, using a CNN.")
